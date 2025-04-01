@@ -1,0 +1,321 @@
+# backend/main.py
+import json
+import logging
+import requests
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import pytesseract
+from pdf2image import convert_from_bytes
+import PyPDF2
+from io import BytesIO
+from typing import Optional, List, Dict
+import ollama
+from PIL import Image, ImageEnhance, ImageFilter
+import re
+
+# Configuration des logs
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = FastAPI(title="PDF PO Extractor", version="2.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+class Item(BaseModel):
+    part_number: Optional[str] = None
+    description: Optional[str] = None
+    quantity: Optional[str] = None
+    unit_price: Optional[str] = None
+    amount: Optional[str] = None
+    ship_date: Optional[str] = None
+
+class ExtractionResult(BaseModel):
+    po_number: Optional[str] = None
+    po_date: Optional[str] = None
+    delivered_to: Optional[str] = None
+    shipped_to: Optional[str] = None
+    vendor_code: Optional[str] = None
+    vendor_ref: Optional[str] = None
+    ship_via: Optional[str] = None
+    ordered_by: Optional[str] = None
+    terms: Optional[str] = None
+    items: List[Item] = []
+    total_without_tax: Optional[str] = None
+    tax: Optional[str] = None
+    tps: Optional[str] = None
+    tvq: Optional[str] = None
+    total_with_tax: Optional[str] = None
+
+def preprocess_image(image: Image.Image) -> Image.Image:
+    """Prétraitement de l'image pour améliorer la qualité OCR."""
+    image = image.convert('L')  # Convertir en niveaux de gris
+    enhancer = ImageEnhance.Contrast(image)
+    image = enhancer.enhance(2.0)  # Augmenter le contraste
+    image = image.filter(ImageFilter.SHARPEN)  # Réduire le bruit
+    return image
+
+def extract_text_from_file(file: UploadFile) -> str:
+    logger.info(f"Extracting text from file: {file.filename}")
+    try:
+        file_content = file.file.read()
+        
+        if file.filename.lower().endswith('.pdf'):
+            try:
+                with BytesIO(file_content) as pdf_file:
+                    reader = PyPDF2.PdfReader(pdf_file)
+                    text = "\n".join([page.extract_text() for page in reader.pages])
+                    if text.strip():
+                        logger.info("Text extracted directly from PDF")
+                        return text
+            except Exception as e:
+                logger.warning(f"Direct PDF extraction failed: {str(e)}, falling back to OCR")
+            
+            images = convert_from_bytes(file_content)
+            text = "\n".join([
+                pytesseract.image_to_string(
+                    preprocess_image(img),
+                    config='--psm 6'  # Mode bloc structuré pour tableaux
+                ) for img in images
+            ])
+            logger.info("Text extracted via OCR with preprocessing")
+            return text
+        
+        image = Image.open(BytesIO(file_content))
+        text = pytesseract.image_to_string(
+            preprocess_image(image),
+            config='--psm 6'
+        )
+        logger.info("Text extracted from image with preprocessing")
+        return text
+    
+    except Exception as e:
+        logger.error(f"File processing error: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Erreur de traitement du fichier: {str(e)}")
+
+def clean_llm_response(response: str) -> Dict:
+    logger.info("Cleaning LLM response")
+    try:
+        response = response.replace("```json", "").replace("```", "")
+        start = response.find('{')
+        end = response.rfind('}') + 1
+        json_str = response[start:end]
+        json_str = re.sub(r'(?<!\\)\\(?!["\\/bfnrt]|u[0-9a-fA-F]{4})', r'', json_str)
+        data = json.loads(json_str)
+        
+        # Convertir les listes en chaînes pour les champs simples
+        for key, value in data.items():
+            if isinstance(value, list) and key != "items":
+                data[key] = " ".join(str(v) for v in value) if value else None
+        return data
+    except Exception as e:
+        logger.error(f"JSON parsing error: {str(e)} - Response: {response}")
+        raise HTTPException(status_code=500, detail=f"Erreur de parsing JSON: {str(e)} - Réponse: {response}")
+
+def check_ollama_health():
+    try:
+        response = requests.get("http://127.0.0.1:11434", timeout=5)
+        if response.status_code != 200:
+            raise Exception(f"Ollama responded with status {response.status_code}")
+        logger.info("Ollama service is healthy")
+    except requests.RequestException as e:
+        logger.error(f"Ollama health check failed: {str(e)}")
+        raise HTTPException(status_code=503, detail="Service Ollama indisponible. Veuillez démarrer Ollama avec 'ollama serve'.")
+
+def validate_result(result: ExtractionResult) -> bool:
+    """Vérifie si les champs essentiels sont présents."""
+    essential_fields = [result.po_number, result.items]
+    return all(field is not None and (isinstance(field, list) and len(field) > 0 or isinstance(field, str)) for field in essential_fields)
+
+def call_llm(text: str, max_retries: int = 2) -> ExtractionResult:
+    logger.info("Calling LLM for text analysis")
+    check_ollama_health()
+    
+    # Ajuster dynamiquement la taille du texte envoyé
+    max_chars = 10000 if len(text) > 10000 else len(text)
+    num_ctx = 4096 if max_chars <= 10000 else 2048  # Réduire si texte long
+    
+    prompt = f"""
+Tu es un expert en extraction de données à partir de bons de commande (PO) en français et anglais. Ton objectif est d'extraire les informations clés du texte ci-dessous et de retourner un JSON valide et précis.
+
+---------------------
+📄 Texte du document :
+{text[:max_chars]}
+---------------------
+
+🎯 Informations à extraire :
+- "po_number" : Numéro du PO (ex: "2203", "4500001234")
+- "po_date" : Date d'émission (ex: "06 Nov 2012" → "2012/11/06", "2023-05-15" → "2023/05/15")
+- "delivered_to" : Adresse de livraison complète (ex: "Mindcore Technologies, 1845 Jean-Monnet, Terrebonne, QC J6X 4L7, Canada")
+- "shipped_to" : Adresse d'expédition (ex: "USINAGE TOURMAC INC., 11 rue de l'Industrie, St-Rémi, QC J0L 2L0")
+- "vendor_code" : Code fournisseur (ex: "M0062", "VEND123")
+- "vendor_ref" : Référence fournisseur (ex: "REF-45678")
+- "ship_via" : Mode d'expédition (ex: "Pickup", "FedEx")
+- "ordered_by" : Émetteur (ex: "Julie Robidoux", "Purchasing Dept")
+- "terms" : Conditions (ex: "Net 30", "Due on receipt")
+- "items" : Liste d'articles avec :
+  - "part_number" : Numéro de pièce (ex: "COPIB187C110287523150280-288", "MC695-005-11")
+  - "description" : Description (ex: "Copper Tube B187C110 2-1/2'' Schedule 80 × 288''")
+  - "quantity" : Quantité (ex: "2", "12.5", "100 pcs")
+  - "unit_price" : Prix unitaire avec devise (ex: "$701.09", "CAD 125.50")
+  - "amount" : Montant total ligne (ex: "$1,402.18")
+  - "ship_date" : Date livraison (ex: "07 Nov 2012" → "2012/11/07")
+- "total_without_tax" : Total HT (ex: "$1,402.18")
+- "tax" : Taxe totale (ex: "$210.33")
+- "tps" : TPS (ex: "$70.10")
+- "tvq" : TVQ (ex: "$140.23")
+- "total_with_tax" : Total TTC (ex: "$1,612.51")
+
+📝 Instructions :
+1. Retourne **uniquement un JSON valide**, sans texte supplémentaire.
+2. Dates au format **AAAA/MM/JJ**. Convertis toutes les variantes (ex: "Nov 7, 2012" → "2012/11/07").
+3. Si un champ est absent, mets `null`. Ne suppose rien.
+4. Conserve les devises dans les montants (ex: "$", "CAD").
+5. Identifie les tableaux ou lignes pour "items" (ex: "Item No", "Qty", "Price").
+6. Si plusieurs valeurs possibles, choisis la plus logique (ex: première date pour "po_date").
+
+📦 Exemples basés sur des PO réels :
+{{
+  "po_number": "2203",
+  "po_date": "2012/11/06",
+  "delivered_to": "Mindcore Technologies, 1845 Jean-Monnet, Terrebonne, QC J6X 4L7, Canada",
+  "shipped_to": "USINAGE TOURMAC INC., 11 rue de l'Industrie, St-Rémi, QC J0L 2L0, Canada",
+  "vendor_code": "M0062",
+  "vendor_ref": null,
+  "ship_via": "Pickup",
+  "ordered_by": "Julie Robidoux",
+  "terms": "Net 30",
+  "items": [
+    {{
+      "part_number": "COPIB187C110287523150280-288",
+      "description": "Copper Tube B187C110 2-1/2'' Schedule 80 × 288''",
+      "quantity": "2",
+      "unit_price": "$701.09",
+      "amount": "$1,402.18",
+      "ship_date": "2012/11/07"
+    }}
+  ],
+  "total_without_tax": "$1,402.18",
+  "tax": null,
+  "tps": null,
+  "tvq": null,
+  "total_with_tax": null
+}}
+{{
+  "po_number": "4500001234",
+  "po_date": "2023/05/15",
+  "delivered_to": "ABC Corp, 123 Industrial Rd, Montreal, QC H1A 1A1",
+  "shipped_to": "ABC Corp, 123 Industrial Rd, Montreal, QC H1A 1A1",
+  "vendor_code": "VEND123",
+  "vendor_ref": "PO-REF-789",
+  "ship_via": "FedEx",
+  "ordered_by": "Purchasing Dept",
+  "terms": "Due on receipt",
+  "items": [
+    {{
+      "part_number": "MC695-005-11",
+      "description": "Steel Bolt 5mm",
+      "quantity": "100",
+      "unit_price": "$0.25",
+      "amount": "$25.00",
+      "ship_date": "2023/05/20"
+    }},
+    {{
+      "part_number": "MC695-006-12",
+      "description": "Steel Nut 6mm",
+      "quantity": "50",
+      "unit_price": "$0.30",
+      "amount": "$15.00",
+      "ship_date": "2023/05/20"
+    }}
+  ],
+  "total_without_tax": "$40.00",
+  "tax": "$6.00",
+  "tps": "$2.00",
+  "tvq": "$4.00",
+  "total_with_tax": "$46.00"
+}}
+"""
+
+    for attempt in range(max_retries):
+        try:
+            response = ollama.generate(
+                model="mistral",
+                prompt=prompt,
+                options={
+                    "temperature": 0.1,
+                    "num_ctx": num_ctx
+                }
+            )
+            logger.info(f"LLM response received (attempt {attempt + 1})")
+            logger.info(f"Raw LLM response: {response['response']}")
+            
+            json_data = clean_llm_response(response['response'])
+            
+            result = ExtractionResult(
+                po_number=json_data.get("po_number"),
+                po_date=json_data.get("po_date"),
+                delivered_to=json_data.get("delivered_to"),
+                shipped_to=json_data.get("shipped_to"),
+                vendor_code=json_data.get("vendor_code"),
+                vendor_ref=json_data.get("vendor_ref"),
+                ship_via=json_data.get("ship_via"),
+                ordered_by=json_data.get("ordered_by"),
+                terms=json_data.get("terms"),
+                total_without_tax=json_data.get("total_without_tax"),
+                tax=json_data.get("tax"),
+                tps=json_data.get("tps"),
+                tvq=json_data.get("tvq"),
+                total_with_tax=json_data.get("total_with_tax")
+            )
+            
+            for item in json_data.get("items", []):
+                result.items.append(Item(**item))
+            
+            if validate_result(result):
+                logger.info("Extraction result prepared and validated")
+                return result
+            else:
+                logger.warning(f"Result validation failed on attempt {attempt + 1}, retrying...")
+                num_ctx = max(num_ctx // 2, 1024)  # Réduire le contexte si échec
+            
+        except ollama.ResponseError as e:
+            logger.error(f"Ollama response error on attempt {attempt + 1}: {str(e)}")
+            if attempt == max_retries - 1:
+                raise HTTPException(status_code=500, detail=f"Erreur de réponse Ollama après {max_retries} tentatives: {str(e)}")
+            num_ctx = max(num_ctx // 2, 1024)  # Réduire le contexte pour la prochaine tentative
+        except Exception as e:
+            logger.error(f"LLM processing error on attempt {attempt + 1}: {str(e)}")
+            if attempt == max_retries - 1:
+                raise HTTPException(status_code=500, detail=f"Erreur du modèle LLM après {max_retries} tentatives: {str(e)}")
+    
+    raise HTTPException(status_code=500, detail="Échec de l'extraction après toutes les tentatives.")
+
+@app.post("/extract", response_model=ExtractionResult)
+async def extract_infos(file: UploadFile = File(...)):
+    logger.info("Received extract request")
+    try:
+        text = extract_text_from_file(file)
+        return call_llm(text)
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        logger.error(f"Unexpected error in extract_infos: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Erreur inattendue: {str(e)}")
+
+@app.get("/health")
+async def health_check():
+    try:
+        check_ollama_health()
+        return {"status": "healthy", "model": "mistral"}
+    except HTTPException as e:
+        raise e
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
